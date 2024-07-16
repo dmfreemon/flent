@@ -27,10 +27,12 @@ import math
 import io
 import itertools
 import os
+import random
 import re
 import shlex
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -458,13 +460,14 @@ class ProcessRunner(RunnerBase):
             else:
                 raise RuntimeError("Unable to create temporary files: %s" % e)
 
-        self.debug("Forking to run command %s", self.command)
+        self.debug("Forking with delay %f to run command %s", self.delay, " ".join(self.args))
         try:
             pid = os.fork()
         except OSError as e:
             raise RuntimeError(f"{self.name}: Error during fork(): {e}")
 
         if pid == 0:
+            # child process
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             devnull = os.open(os.devnull, os.O_RDWR)
             os.dup2(devnull, 0)
@@ -493,6 +496,7 @@ class ProcessRunner(RunnerBase):
             os.write(2, f"{time.time()}: PID {pid} running execvpe({' '.join(self.args)})\n".encode("utf-8"))
             os.execvpe(prog, self.args, env)
         else:
+            # parent process
             self.debug("Forked %s as pid %d", self.args[0], pid)
             self.pid = pid
             self.start_time = time.monotonic()
@@ -684,9 +688,20 @@ class ProcessRunner(RunnerBase):
 
         return ""
 
+    # arg in stdout from runner process
     def split_stream(self, stream, delim="---"):
+        # dump ss output to file for debugging
+        #if hasattr(self, "debug_pid_file_is_open") and self.debug_pid_file_is_open == True:
+        #    pass
+        #else:
+        #    self.debug_pid_file = "stdout_pid_{}".format(self.pid)
+        #    self.debug_file = open(self.debug_pid_file, "w")
+        #    self.debug_pid_file_is_open = True
+
         part = ""
         for line in stream:
+            #self.debug_file.write(line)      # still contains newlines
+
             if line.strip() == delim:
                 yield part.strip()
                 part = ""
@@ -1007,6 +1022,8 @@ class NetperfDemoRunner(ProcessRunner):
         return result, raw_values, metadata
 
     def check(self):
+        self.debug("check(): new %s runner for host %s delay %s length %s", self.__class__.__name__, self.host, self.delay, self.length)
+
         args = self.runner_args.copy()
 
         if self.test.lower() == 'omni':
@@ -1123,23 +1140,66 @@ class NetperfDemoRunner(ProcessRunner):
         else:
             args['socket_timeout'] = ""
 
+        # preselect a data port so we can run SsRunner using the port number as the ss filter
+        netperf_remote_data_port = random.randrange(32768, 60000)
+        args['netperf_remote_data_port'] = "-P ,{}".format(netperf_remote_data_port)
+
         if self.test in ("TCP_STREAM", "TCP_MAERTS"):
             args['format'] = "-f m"
             if args['send_size']:
                 args['send_size'] = "-m {0} -M {0}".format(args['send_size'])
             self.units = 'Mbits/s'
 
-            if args['test'] == 'TCP_STREAM' and self.settings.SOCKET_STATS:
+            # Do not use the test-specific "-H <host>" argument because it does not work
+            # when the remote host has a different address assigned to the interface than
+            # what it is known as from the public networks.  IOW, this does not work when
+            # the remote host is on GCP and possibly other cloud providers.
+            # The error (on the remote host) is:
+            # netperf: create_data_socket: data socket bind failed: Cannot assign requested address (errno 99)
+            # This is EADDRNOTAVAIL
+            args['host'] = ""
+
+            # A couple of notes here:
+            # 1. remote_host is never used for SsRunner, because we always run the ss_iterate script locally.
+            # 2. Currently, it is assumed that "this" host (where flent is running) is one of the endpoints of
+            #    the netperf flow.  This does not necessarily have to be true, but an adjustment will be needed
+            #    here (to the ssX_host variables) for ss data to be gathered from the correct remote hosts.
+            if self.settings.SOCKET_STATS:
+                if args['test'] == 'TCP_STREAM':
+                    # upload direction
+                    ss1_host = 'localhost'
+                    ss1_metric_prefix = 'tcps'
+                    ss2_host = self.host
+                    ss2_metric_prefix = 'tcpr'
+                else:
+                    # download direction
+                    ss1_host = 'localhost'
+                    ss1_metric_prefix = 'tcpr'
+                    ss2_host = self.host
+                    ss2_metric_prefix = 'tcps'
+
                 self.add_child(SsRunner,
-                               exclude_ports=(args['control_port'],),
-                               delay=self.delay,
-                               remote_host=None,
-                               host=self.remote_host or 'localhost',
-                               interval=args['interval'],
-                               length=self.length,
-                               target=self.host,
-                               ip_version=args['ip_version'])
-            args['host'] = f"-H {args['host']}"
+                            delay=self.delay,
+                            remote_host=None,
+                            host=ss1_host,                  # where ss data should come from
+                            interval=args['interval'],
+                            length=self.length,
+                            remote_data_port=netperf_remote_data_port,
+                            metric_prefix=ss1_metric_prefix,
+                            ssh_user=self.settings.SSH_USER,
+                            ssh_private_key_file=self.settings.SSH_PRIVATE_KEY_FILE,
+                            ip_version=args['ip_version'])
+                self.add_child(SsRunner,
+                            delay=self.delay,
+                            remote_host=None,
+                            host=ss2_host,                  # where ss data should come from
+                            interval=args['interval'],
+                            length=self.length,
+                            remote_data_port=netperf_remote_data_port,
+                            metric_prefix=ss2_metric_prefix,
+                            ssh_user=self.settings.SSH_USER,
+                            ssh_private_key_file=self.settings.SSH_PRIVATE_KEY_FILE,
+                            ip_version=args['ip_version'])
 
         elif self.test == 'UDP_RR':
             self.units = 'ms'
@@ -1164,7 +1224,7 @@ class NetperfDemoRunner(ProcessRunner):
                        "-t {test} -l {length:d} {buffer} {format} " \
                        "{control_local_bind} {extra_args} -- " \
                        "{socket_timeout} {send_size} {local_bind} {host} -k {output_vars} " \
-                       "{cong_control} {extra_test_args}".format(**args)
+                       "{cong_control} {netperf_remote_data_port} {extra_test_args}".format(**args)
 
         super(NetperfDemoRunner, self).check()
 
@@ -1665,14 +1725,14 @@ class IrttRunner(ProcessRunner):
                  local_bind=None, marking=None, multi_results=False,
                  sample_freq=0, data_size=None, **kwargs):
         self.host = normalise_host(host, bracket_v6=True)
-        self.interval = interval
-        self.length = length
+        self.interval = interval            # irtt send interval (in seconds)
+        self.length = length                # run duration
         self.ip_version = ip_version
         self.local_bind = local_bind
         self.marking = marking
         self.multi_results = multi_results
-        self.sample_freq = sample_freq
-        self.data_size = data_size
+        self.sample_freq = sample_freq      # step size
+        self.data_size = data_size          # irtt packet length
         super(IrttRunner, self).__init__(**kwargs)
 
     # irtt outputs all durations in nanoseconds
@@ -1683,7 +1743,8 @@ class IrttRunner(ProcessRunner):
         return value / 10**9
 
     def parse(self, output, error):
-        result = {'rtt': [], 'delay': [], 'jitter': [], 'loss': []}
+        result = {'rtt': [], 'delay': [], 'jitter': [], 'ipdv': [], 'ipdv_up': [], 'ipdv_down': [],
+            'loss': [], 'loss_up': [], 'loss_down': []}
         raw_values = []
         metadata = {}
         try:
@@ -1718,7 +1779,16 @@ class IrttRunner(ProcessRunner):
                                          / 10**6)
 
         next_sample = 0
+
+        # calculate medians for irtt "this intervals"
+        rtt_vals_this_interval = []
+        ipdv_vals_this_interval = []
+        ipdv_up_vals_this_interval = []
+        ipdv_down_vals_this_interval = []
         lost = 0
+        lost_up = 0
+        lost_down = 0
+
         for pkt in data['round_trips']:
             try:
                 dp = {'seq': pkt['seqno']}
@@ -1738,15 +1808,60 @@ class IrttRunner(ProcessRunner):
                         pass
 
                     if dp['t'] >= next_sample:
-                        result['rtt'].append([dp['t'], dp['val']])
+                        try:
+                            rtt_median = statistics.median(rtt_vals_this_interval)
+                        except:
+                            rtt_median = 0.0
+
+                        result['rtt'].append([dp['t'], rtt_median])
                         # delay and jitter are for compatibility with the D-ITG
                         # VoIP mode
                         result['delay'].append([dp['t'], dp['owd_up']])
                         result['jitter'].append([dp['t'],
                                                  abs(dp.get('ipdv_up', 0))])
+
+                        try:
+                            ipdv_median = statistics.median(ipdv_vals_this_interval)
+                        except:
+                            ipdv_median = 0.0
+
+                        try:
+                            ipdv_up_median = statistics.median(ipdv_up_vals_this_interval)
+                        except:
+                            ipdv_up_median = 0.0
+
+                        try:
+                            ipdv_down_median = statistics.median(ipdv_down_vals_this_interval)
+                        except:
+                            ipdv_down_median = 0.0
+
+                        result['ipdv'].append([dp['t'], ipdv_median])
+                        result['ipdv_up'].append([dp['t'], ipdv_up_median])
+                        result['ipdv_down'].append([dp['t'], ipdv_down_median])
+
                         result['loss'].append([dp['t'], lost])
+                        result['loss_up'].append([dp['t'], lost_up])
+                        result['loss_down'].append([dp['t'], lost_down])
+
+                        rtt_vals_this_interval = []
+                        ipdv_vals_this_interval = []
+                        ipdv_up_vals_this_interval = []
+                        ipdv_down_vals_this_interval = []
                         lost = 0
+                        lost_up = 0
+                        lost_down = 0
                         next_sample = dp['t'] + self.sample_freq
+                    else:
+                        rtt = dp['val']
+                        ipdv = abs(dp.get('ipdv', 0))
+                        ipdv_up = abs(dp.get('ipdv_up', 0))
+                        ipdv_down = abs(dp.get('ipdv_down', 0))
+
+                        rtt_vals_this_interval.append(rtt)
+                        ipdv_vals_this_interval.append(ipdv)
+                        ipdv_up_vals_this_interval.append(ipdv_up)
+                        ipdv_down_vals_this_interval.append(ipdv_down)
+
                 else:
                     lost_dir = pkt['lost'].replace('true_', '')
                     dp['lost'] = True
@@ -1754,6 +1869,10 @@ class IrttRunner(ProcessRunner):
                     dp['t'] = self._to_s(
                         pkt['timestamps']['client']['send']['wall'])
                     lost += 1
+                    if lost_dir == "up":
+                        lost_up += 1
+                    elif lost_dir == "down":
+                        lost_down += 1
 
                 raw_values.append(dp)
             except KeyError as e:
@@ -1866,15 +1985,26 @@ class VoipRunner(DelegatingRunner):
 
         super(VoipRunner, self).check()
 
+class UdpRunner(DelegatingRunner):
+
+    def check(self):
+        try:
+            self.add_child(IrttRunner,
+                           **dict(self.runner_args,
+                                  multi_results=True,
+                                  sample_freq=self.runner_args['interval'],             # step size
+                                  interval=self.runner_args['irtt_send_interval'],      # irtt send interval (in seconds)
+                                  data_size=self.runner_args['irtt_packet_length']))    # irtt packet length (in bytes)
+            self.debug("Using irtt")
+        except RunnerCheckError as e:
+            self.debug("Cannot use irtt runner (%s)", e)
+            raise e
+
+        super(UdpRunner, self).check()
 
 class SsRunner(ProcessRunner):
     """Runner for iterated `ss -t -i -p`. Depends on same partitial output
     separationa and time stamping as TcRunner."""
-
-    # Keep track of runners to avoid duplicates (relies on this being a class
-    # variable, and so the same dictionary instance across all instances of the
-    # class).
-    _duplicate_map = {}
 
     ip_v4_addr_sub_re = r"([0-9]{1,3}\.){3}[0-9]{1,3}(:\d+)"
     # ref.: to commented, untinkered version: ISBN 978-0-596-52068-7
@@ -1884,7 +2014,7 @@ class SsRunner(ProcessRunner):
                         r"{1,7}|:))\]?(:\d+)"
 
     time_re = re.compile(r"^Time: (?P<timestamp>\d+\.\d+)", re.MULTILINE)
-    pid_re = re.compile(r"pid=(?P<pid>\d+)", re.MULTILINE)
+    #pid_re = re.compile(r"pid=(?P<pid>\d+)", re.MULTILINE)
     ports_ipv4_re = re.compile(r"" + "(?P<src_p>" + ip_v4_addr_sub_re + ")" +
                                r"\s+" + "(?P<dst_p>" + ip_v4_addr_sub_re + ")")
     ports_ipv6_re = re.compile(r"" + "(?P<src_p>" + ip_v6_addr_sub_re + ")" +
@@ -1895,15 +2025,23 @@ class SsRunner(ProcessRunner):
     data_res = [re.compile(r"cwnd:(?P<cwnd>\d+)", re.MULTILINE),
                 re.compile(r"rtt:(?P<rtt>\d+\.\d+)/(?P<rtt_var>\d+\.\d+)",
                            re.MULTILINE),
-                re.compile(r"pacing_rate (?P<pacing_rate>\d+(\.\d+)?[MK]?bps)",
-                           re.MULTILINE),
-                re.compile(r"delivery_rate (?P<delivery_rate>\d+(\.\d+)?[MK]?bps)",
-                           re.MULTILINE),
-                re.compile(r"bbr:\(bw:(?P<bbr_bw>\d+(\.\d+)?[MK]?bps),"
-                           r"mrtt:(?P<bbr_mrtt>\d+\.\d+),"
-                           r"pacing_gain:(?P<bbr_pacing_gain>\d+(\.\d+)?),"
-                           r"cwnd_gain:(?P<bbr_cwnd_gain>\d+(\.\d+)?)\)",
-                           re.MULTILINE)]
+                re.compile(r"lost:(?P<lost>\d+)", re.MULTILINE),
+                re.compile(r"retrans:\d+\/(?P<retranst>\d+)", re.MULTILINE),
+                re.compile(r"data_segs_out:(?P<dsegsout>\d+)", re.MULTILINE),
+                re.compile(r"bytes_retrans:(?P<bytes_retrans>\d+)", re.MULTILINE),
+                re.compile(r"bytes_sent:(?P<bytes_sent>\d+)", re.MULTILINE),
+                re.compile(r"bytes_received:(?P<bytes_received>\d+)", re.MULTILINE),
+                ]
+
+                # re.compile(r"pacing_rate (?P<pacing_rate>\d+(\.\d+)?[MK]?bps)",
+                #            re.MULTILINE),
+                # re.compile(r"delivery_rate (?P<delivery_rate>\d+(\.\d+)?[MK]?bps)",
+                #            re.MULTILINE),
+                # re.compile(r"bbr:\(bw:(?P<bbr_bw>\d+(\.\d+)?[MK]?bps),"
+                #            r"mrtt:(?P<bbr_mrtt>\d+\.\d+),"
+                #            r"pacing_gain:(?P<bbr_pacing_gain>\d+(\.\d+)?),"
+                #            r"cwnd_gain:(?P<bbr_cwnd_gain>\d+(\.\d+)?)\)",
+                #            re.MULTILINE)]
 
     src_p = []
     dst_p = []
@@ -1915,35 +2053,26 @@ class SsRunner(ProcessRunner):
 
     silent = True
 
-    def __init__(self, exclude_ports, ip_version, host, interval,
-                 length, target, **kwargs):
-        self.exclude_ports = exclude_ports
+    def __init__(self, ip_version, host, interval,
+                 length, remote_data_port, metric_prefix, ssh_user, ssh_private_key_file, **kwargs):
         self.ip_version = ip_version
         self.host = normalise_host(host)
         self.interval = interval
         self.length = length
-        self.target = target
-        self.is_dup = False
-        self._dup_key = None
+        self.remote_data_port = remote_data_port
+        self.metric_prefix = metric_prefix
+        self.ssh_user = ssh_user
+        self.ssh_private_key_file = ssh_private_key_file
+
         self._parsed_parts = None
-        self._dup_runner = None
+
         super(SsRunner, self).__init__(**kwargs)
 
     def fork(self):
-        if self._dup_runner is None:
-            self.debug("Active runner for dup key %s: forking", self._dup_key)
-            return super().fork()
-        else:
-            self.debug("Duplicate for dup key %s. Not forking", self._dup_key)
-            return 0
+        return super().fork()
 
     def run(self):
-        if self._dup_runner is None:
-            super(SsRunner, self).run()
-            del self._duplicate_map[self._dup_key]
-            return
-
-        self._dup_runner.join()
+        super(SsRunner, self).run()
 
     def filter_np_parent(self, part):
         parsed_parts = []
@@ -1952,15 +2081,6 @@ class SsRunner(ProcessRunner):
                      and not self.ss_header_re.search(sp)]
 
         for sp in sub_parts:
-            # Filter out stats from netserver when it's run along with ss
-            if "netserver" in sp:
-                continue
-
-            pid = self.pid_re.search(sp)
-            if None is pid:
-                continue
-            pid_str = pid.group('pid')
-
             f_ports = self.ports_ipv4_re.search(sp)
             if None is f_ports:
                 f_ports = self.ports_ipv6_re.search(sp)
@@ -1968,9 +2088,10 @@ class SsRunner(ProcessRunner):
             if None is f_ports:
                 raise ParseError()
 
+            src_p = int(f_ports.group('src_p').split(":")[-1])
             dst_p = int(f_ports.group('dst_p').split(":")[-1])
 
-            parsed_parts.append({'dst_p': dst_p, 'sp': sp, 'pid': pid_str})
+            parsed_parts.append({'src_p': src_p, 'dst_p': dst_p, 'sp': sp})
 
         return parsed_parts
 
@@ -1983,6 +2104,10 @@ class SsRunner(ProcessRunner):
             return float(val[:-3]) / 10**6
         return float(val)
 
+    # subpart is (one string):
+    # ' 0      1       10.96.20.26:44175 10.197.160.12:42603 users:(("netperf",pid=985594,fd=4))\n\t cubic rto:1000 mss:524 pmtu:1280
+    # rcvmss:88 advmss:1240 cwnd:10 segs_out:1 lastsnd:334519048 lastrcv:334519048 lastack:334519048 app_limited unacked:1
+    # rcv_ssthresh:64480\n\nTime: 1720887214.628606603'
     def parse_subpart(self, sub_part):
         vals = {}
         for r in self.data_res:
@@ -1991,11 +2116,16 @@ class SsRunner(ProcessRunner):
                 d = m.groupdict()
                 for k, v in d.items():
                     try:
-                        vals['tcp_%s' % k] = self.parse_val(v)
+                        vals['%s_%s' % (self.metric_prefix, k)] = self.parse_val(v)
                     except ValueError:
                         pass
+
         return vals
 
+    # part is (one string):
+    # 'State    Recv-Q Send-Q Local Address:Port    Peer Address:Port Process\nSYN-SENT 0      1       10.96.20.26:44175 10.197.160.12:42603
+    # users:(("netperf",pid=985594,fd=4))\n\t cubic rto:1000 mss:524 pmtu:1280 rcvmss:88 advmss:1240 cwnd:10 segs_out:1 lastsnd:334519048
+    # lastrcv:334519048 lastack:334519048 app_limited unacked:1 rcv_ssthresh:64480\n\nTime: 1720887214.628606603'
     def parse_part(self, part):
         sub_parts = self.filter_np_parent(part)
 
@@ -2010,17 +2140,16 @@ class SsRunner(ProcessRunner):
             if not v:
                 continue
             v.update({'t': timestamp,
-                      'dst_p': sp['dst_p'],
-                      'pid': sp['pid']})
+                      'src_p': sp['src_p'],
+                      'dst_p': sp['dst_p']})
             vals.append(v)
 
         return vals
 
     def do_parse(self, pool):
-        if not self.is_dup:
-            return super().do_parse(pool)
-        return []
+        return super().do_parse(pool)
 
+    # args are stdout and stderr
     def parse(self, output, error):
         parsed_parts = []
         for part in self.split_stream(output):
@@ -2035,64 +2164,49 @@ class SsRunner(ProcessRunner):
 
     @property
     def parsed_parts(self):
-        if self.is_dup:
-            return self._dup_runner.parsed_parts
         if self._parsed_parts is None:
             self._parsed_parts = self.metadata.pop('parsed_parts', [])
         return self._parsed_parts
 
     def post_parse(self):
-        par_pid = str(self._parent.pid)
         results = {}
         raw_values = []
 
         for res_dict in self.parsed_parts:
-            if res_dict['pid'] != par_pid or res_dict['dst_p'] in self.exclude_ports:
-                continue
+            # there can only be one flow at this point!
+
             t = res_dict['t']
             for k, v in res_dict.items():
-                if k in ('t', 'pid', 'dst_p'):
+                if k in ('t', 'src_p', 'dst_p'):
                     continue
                 if k not in results:
                     results[k] = [[t, v]]
                 else:
                     results[k].append([t, v])
             rw = res_dict.copy()
-            del rw['pid']
+            del rw['src_p']
             del rw['dst_p']
             raw_values.append(rw)
 
         if not results:
-            extra = {'runner': self} if not self.is_dup else None
-            logger.warning("%s%s: Found no results for pid %s",
+            logger.warning("%s: Found no results for host %s",
                            self.__class__.__name__,
-                           "(dup)" if self.is_dup else "",
-                           par_pid, extra=extra)
+                           self.host)
+
         self.result = results
         self.raw_values = raw_values
 
     def check(self):
-        dup_key = (self.host, self.interval, self.length, self.target,
-                   self.ip_version, tuple(self.exclude_ports))
-
-        if dup_key in self._duplicate_map:
-            self.debug("Found duplicate runner (%s), reusing output", dup_key)
-            self._dup_runner = self._duplicate_map[dup_key]
-            self.is_dup = True
-            self.command = "%s (duplicate)" % self._dup_runner.command
-        else:
-            self.debug("Starting new runner (dup key %s)", dup_key)
-            self._dup_runner = None
-            self._duplicate_map[dup_key] = self
-            self.command = self.find_binary(self.ip_version, self.host,
-                                            self.interval, self.length,
-                                            self.target)
-            self.watchdog_timer = self.delay + self.length + 5
-
-        self._dup_key = dup_key
+        self.debug("check(): new %s runner for host %s delay %s length %s", self.__class__.__name__, self.host, self.delay, self.length)
+        self.command = self.find_binary(self.ip_version, self.host,
+                                        self.interval, self.length,
+                                        self.remote_data_port,
+                                        self.ssh_user,
+                                        self.ssh_private_key_file)
+        self.watchdog_timer = self.delay + self.length + 5
         super(SsRunner, self).check()
 
-    def find_binary(self, ip_version, host, interval, length, target):
+    def find_binary(self, ip_version, host, interval, length, remote_data_port, ssh_user, ssh_private_key_file):
         script = os.path.join(DATA_DIR, 'scripts', 'ss_iterate.sh')
         if not os.path.exists(script):
             raise RunnerCheckError("Cannot find ss_iterate.sh.")
@@ -2101,23 +2215,31 @@ class SsRunner(ProcessRunner):
         if not bash:
             raise RunnerCheckError("Socket stats requires a Bash shell.")
 
-        resol_target = util.lookup_host(target, ip_version)[4][0]
-        if ip_version == 6:
-            resol_target = "[" + str(resol_target) + "]"
+        if host == "localhost":
+            # running on _this_ host
+            filt = "dport = {}".format(remote_data_port)
+        else:
+            # running remotely
+            filt = "sport = {}".format(remote_data_port)
 
-        filt = ""
-        for p in self.exclude_ports:
-            filt = "{} and dport != {}".format(filt, p)
-
-        return "{bash} {script} -I {interval:.2f} " \
-            "-l {length} -H {host} -t '{target}' -f '{filt}'".format(
+        cmd_str = "{bash} {script} -I {interval:.2f} " \
+            "-l {length} -H {host}".format(
                 bash=bash,
                 script=script,
                 interval=interval,
                 length=length,
-                host=host,
-                target=resol_target,
-                filt=filt)
+                host=host)
+
+        if ssh_user:
+            cmd_str += " -u " + ssh_user
+
+        if ssh_private_key_file:
+            cmd_str += " -i " + ssh_private_key_file
+
+        if filt:
+            cmd_str += " -f '" + filt + "'"
+
+        return cmd_str
 
 
 class TcRunner(ProcessRunner):
@@ -2180,7 +2302,7 @@ class TcRunner(ProcessRunner):
     cake_1tin_re = re.compile(cake_tin_re)
     cake_keys = ["av_delay", "sp_delay", "pkts", "bytes",
                  "drops", "marks", "sp_flows", "bk_flows", "max_len"]
-    cumulative_keys = ["dropped", "ecn_mark"]
+    cumulative_keys = ["dropped", "ecn_mark", "sent_pkts"]
 
     def __init__(self, interface, interval, length, host='localhost', **kwargs):
         self.interface = interface
@@ -2715,6 +2837,14 @@ class DiffMinRunner(ComputingRunner):
                                    for i in res[key]])
         return res
 
+class Diff3Runner(ComputingRunner):
+    command = "Difference (computed)"
+
+    def compute(self, values):
+        if len(values) != 3:
+            return None
+
+        return values[0] - values[1] - values[2]
 
 class FairnessRunner(ComputingRunner):
     command = "Fairness (computed)"

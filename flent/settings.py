@@ -243,6 +243,16 @@ parser.add_argument(
     "command line and then wanting to flip through them without drawing delay.")
 
 parser.add_argument(
+    "--ssh-user",
+    action="store", type=unicode, dest="SSH_USER", default="flent",
+    help="foo")
+
+parser.add_argument(
+    "--ssh-private-key-file",
+    action="store", type=unicode, dest="SSH_PRIVATE_KEY_FILE", default="",
+    help="foo")
+
+parser.add_argument(
     "-b", "--batch",
     action="append", type=unicode, dest="BATCH_NAMES", metavar="BATCH_NAME",
     default=[], help="Run test batch BATCH_NAME (must be specified in a batch "
