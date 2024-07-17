@@ -1379,6 +1379,8 @@ class TimeseriesPlotter(Plotter):
         for a in config['axes']:
             a.minorticks_on()
 
+        axis.yaxis.set_major_formatter(matplotlib.ticker.EngFormatter())
+
         unit = [None] * len(config['axes'])
         for s in config['series']:
             if 'axis' in s and s['axis'] == 2:
