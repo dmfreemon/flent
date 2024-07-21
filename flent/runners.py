@@ -899,6 +899,7 @@ class NetperfDemoRunner(ProcessRunner):
         self.length = length
         self.host = normalise_host(host)
         self.bytes = bytes
+        self.netperf_cong_control = None
         super(NetperfDemoRunner, self).__init__(**kwargs)
 
     def parse(self, output, error):
@@ -1009,6 +1010,13 @@ class NetperfDemoRunner(ProcessRunner):
                         metadata['BYTES_RECVD'] = int(data_dict.get(
                             'LOCAL_BYTES_RECVD', -1))
                         metadata['DATA_TOS'] = metadata['DOWNSTREAM_TOS']
+
+                    if self.netperf_cong_control:
+                        logger.debug("tcp congestion control: requested %s used %s",
+                            self.netperf_cong_control, metadata['CONG_CONTROL'])
+                        if metadata['CONG_CONTROL'] != self.netperf_cong_control:
+                            logger.error("Incorrect congestion control algorithm was used.  Requested %s but %s was used",
+                                self.netperf_cong_control, metadata['CONG_CONTROL'])
 
                     for k in data_dict.keys():
                         if k.startswith("tcpi"):
@@ -1129,6 +1137,7 @@ class NetperfDemoRunner(ProcessRunner):
             args['marking'] = self.parse_marking(args['marking'], "-Y {}", True)
 
         if args['cong_control']:
+            self.netperf_cong_control = args['cong_control']
             args['cong_control'] = "-K {0}".format(args['cong_control'])
 
         for c in 'local_bind', 'control_local_bind':
@@ -2119,6 +2128,12 @@ class SsRunner(ProcessRunner):
                         vals['%s_%s' % (self.metric_prefix, k)] = self.parse_val(v)
                     except ValueError:
                         pass
+
+        # convert None to zeroes (so that plot lines appear, even when zero)
+        for metric_name in ["bytes_sent", "bytes_retrans", "bytes_received"]:
+            k = "{}_{}".format(self.metric_prefix, metric_name)
+            if k not in vals:
+                vals[k] = 0
 
         return vals
 

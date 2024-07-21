@@ -791,6 +791,8 @@ class Plotter(ArgParam):
                 logger.debug("Showing matplotlib pyplot viewer")
                 pyplot.show()
         else:
+            if self.output == "DEFAULT.png":
+                self.output = results[0].dump_filename + ".png"
             logger.debug("Saving plot to %s", self.output)
             try:
                 # PDFs have fixed DPI
