@@ -1149,9 +1149,11 @@ class NetperfDemoRunner(ProcessRunner):
         else:
             args['socket_timeout'] = ""
 
+        #netperf_local_data_port = 2425
+        netperf_local_data_port = ""
         # preselect a data port so we can run SsRunner using the port number as the ss filter
         netperf_remote_data_port = random.randrange(32768, 60000)
-        args['netperf_remote_data_port'] = "-P ,{}".format(netperf_remote_data_port)
+        args['netperf_remote_data_port'] = "-P {},{}".format(netperf_local_data_port, netperf_remote_data_port)
 
         if self.test in ("TCP_STREAM", "TCP_MAERTS"):
             args['format'] = "-f m"
